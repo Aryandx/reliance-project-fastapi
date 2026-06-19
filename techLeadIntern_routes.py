@@ -1,72 +1,96 @@
 """
 techLeadIntern_routes.py
 ────────────────────────────────────────────────────────────────────────────────
-FastAPI router — Tech Lead & Intern endpoints.
-Equivalent of techLeadIntern.routes.js, rewritten for FastAPI + Motor.
+FastAPI router — Tech Lead & Intern feature endpoints.
 
-Mounted at /api/intern-tracker in main.py.
+DROP INTO:  app/routers/techLeadIntern_routes.py
 
-All routes require a valid JWT in the Authorization header:
-    Authorization: Bearer <token>
+MOUNT in your main FastAPI app:
+    from app.routers.techLeadIntern_routes import router as tracker_router
+    app.include_router(tracker_router, prefix="/api/intern-tracker", tags=["Intern Tracker"])
+
+DEPENDS ON auth_router.py being in the same package:
+    from app.routers.auth_router import get_current_user, require_role
+
+    If your codebase already has its own get_current_user / require_role,
+    replace the import on line ~45 with your own.
+
+ENV VARS (same .env as auth_router.py):
+    USER_COLLECTION, INTERN_COLLECTION, ASSIGNMENT_COLLECTION,
+    STANDUP_COLLECTION, MILESTONE_COLLECTION, REVIEW_COLLECTION, SSO_ID_FIELD
 
 Endpoints
 ─────────
-  Intern (role = "Intern")
-    GET  /intern/me
-    GET  /intern/standup/today
-    POST /intern/standup
-    GET  /intern/standups
-    GET  /intern/progress
-    GET  /intern/compliance
-    GET  /intern/feedback
+  Intern  (role = "Intern")
+    GET   /intern/me
+    GET   /intern/standup/today
+    POST  /intern/standup
+    GET   /intern/standups
+    GET   /intern/progress
+    PATCH /intern/milestone/{milestone_id}    ← intern self-updates milestone status
+    GET   /intern/streak                      ← current consecutive submission streak
+    GET   /intern/compliance
+    GET   /intern/feedback
 
-  Tech Lead (role = "Tech Lead")
-    GET  /tech-lead/interns
-    GET  /tech-lead/standup-feed
-    GET  /tech-lead/reviews
-    POST /tech-lead/reviews/{review_id}/forward
-    POST /tech-lead/assign-buddy
-    GET  /tech-lead/buddies
-    GET  /tech-lead/dashboard-summary
+  Tech Lead  (role = "Tech Lead")
+    GET   /tech-lead/interns
+    GET   /tech-lead/standup-feed
+    GET   /tech-lead/reviews
+    POST  /tech-lead/reviews/{review_id}/forward
+    POST  /tech-lead/assign-buddy
+    GET   /tech-lead/buddies
+    GET   /tech-lead/dashboard-summary
 ────────────────────────────────────────────────────────────────────────────────
 """
 
+import asyncio
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import JWTError, jwt
 from pydantic import BaseModel
+
+# ── Import auth from auth_router (same package) ───────────────────────────────
+# If your codebase already exports these, replace this import line:
+from auth_router import get_current_user, require_role
 
 load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
-JWT_SECRET    = os.getenv("JWT_SECRET",    "change_this_secret")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-SSO_ID_FIELD  = os.getenv("SSO_ID_FIELD",  "employeeId")
+# ── Collection names ──────────────────────────────────────────────────────────
+SSO_ID_FIELD   = os.getenv("SSO_ID_FIELD",              "employeeId")
+INTERN_COL     = os.getenv("INTERN_COLLECTION",          "interns")
+USER_COL       = os.getenv("USER_COLLECTION",            "users")
+ASSIGNMENT_COL = os.getenv("ASSIGNMENT_COLLECTION",      "assignments")
+STANDUP_COL    = os.getenv("STANDUP_COLLECTION",         "standups")
+MILESTONE_COL  = os.getenv("MILESTONE_COLLECTION",       "milestones")
+REVIEW_COL     = os.getenv("REVIEW_COLLECTION",          "reviews")
 
-INTERN_COL     = os.getenv("INTERN_COLLECTION",     "interns")
-USER_COL       = os.getenv("USER_COLLECTION",       "users")
-ASSIGNMENT_COL = os.getenv("ASSIGNMENT_COLLECTION", "assignments")
-STANDUP_COL    = os.getenv("STANDUP_COLLECTION",    "standups")
-MILESTONE_COL  = os.getenv("MILESTONE_COLLECTION",  "milestones")
-REVIEW_COL     = os.getenv("REVIEW_COLLECTION",     "reviews")
+MILESTONE_STATUSES = {"PENDING", "IN_PROGRESS", "COMPLETED"}
 
-router   = APIRouter()
-security = HTTPBearer()
+router = APIRouter()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def get_db(request: Request):
+def _db(request: Request):
     return request.app.state.db
 
 
+def _utc_today() -> datetime:
+    """Naive UTC midnight — matches how MongoDB stores dates inserted by this router."""
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+
+
+def _strip_tz(dt: datetime) -> datetime:
+    """Make a datetime timezone-naive (UTC) so MongoDB range queries work correctly."""
+    return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+
 def serialize(doc: dict | None) -> dict | None:
-    """Convert ObjectId fields to strings so FastAPI can JSON-encode them."""
+    """Recursively convert ObjectId → str so FastAPI can JSON-encode the document."""
     if doc is None:
         return None
     result = {}
@@ -74,7 +98,10 @@ def serialize(doc: dict | None) -> dict | None:
         if isinstance(v, ObjectId):
             result[k] = str(v)
         elif isinstance(v, list):
-            result[k] = [serialize(i) if isinstance(i, dict) else (str(i) if isinstance(i, ObjectId) else i) for i in v]
+            result[k] = [
+                serialize(i) if isinstance(i, dict) else (str(i) if isinstance(i, ObjectId) else i)
+                for i in v
+            ]
         elif isinstance(v, dict):
             result[k] = serialize(v)
         else:
@@ -83,62 +110,40 @@ def serialize(doc: dict | None) -> dict | None:
 
 
 def oid(s: str) -> ObjectId:
-    """String → ObjectId, raises 400 on bad format."""
+    """String → ObjectId. Raises HTTP 400 on bad format."""
     try:
         return ObjectId(s)
     except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid id: {s}")
+        raise HTTPException(status_code=400, detail=f"Invalid ObjectId: '{s}'")
 
 
-def today_start() -> datetime:
-    t = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    return t
-
-
-def count_working_days(start: datetime, end: datetime) -> int:
+def _count_working_days(start: datetime, end: datetime) -> int:
+    """Count Mon–Fri days between start and end inclusive. Handles tz-aware or naive."""
+    start = _strip_tz(start).replace(hour=0, minute=0, second=0, microsecond=0)
+    end   = _strip_tz(end).replace(hour=0, minute=0, second=0, microsecond=0)
     count = 0
-    cursor = start.replace(hour=0, minute=0, second=0, microsecond=0)
-    end    = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    cursor = start
     while cursor <= end:
-        if cursor.weekday() < 5:   # Mon–Fri
+        if cursor.weekday() < 5:
             count += 1
         cursor += timedelta(days=1)
     return count
 
 
-# ── Auth dependencies ─────────────────────────────────────────────────────────
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> dict:
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return payload
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-
-def require_role(*roles: str):
-    """Usage: Depends(require_role("Intern"))  or  Depends(require_role("Tech Lead", "HR"))"""
-    async def checker(user: dict = Depends(get_current_user)) -> dict:
-        if user.get("role") not in roles:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Requires role: {' or '.join(roles)}. You have: {user.get('role')}",
-            )
-        return user
-    return checker
+def _is_weekday() -> bool:
+    return datetime.now(timezone.utc).weekday() < 5   # Mon=0 … Sun=6
 
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  INTERN ROUTES
 # ════════════════════════════════════════════════════════════════════════════════
 
-@router.get("/intern/me", summary="Intern: own profile + assignment")
+@router.get("/intern/me", summary="Intern: own profile + assignment (with manager / TL / buddy names)")
 async def get_intern_me(
     request: Request,
-    user: dict = Depends(require_role("Intern")),
+    user:    dict = Depends(require_role("Intern")),
 ):
-    db = get_db(request)
+    db     = _db(request)
     sso_id = user.get(SSO_ID_FIELD)
 
     intern = serialize(await db[INTERN_COL].find_one({"employeeId": sso_id}))
@@ -160,48 +165,47 @@ async def get_intern_me(
         }},
         {"$project": {"_mgr": 0, "_tl": 0, "_buddy": 0}},
     ]
-    rows = await db[ASSIGNMENT_COL].aggregate(pipeline).to_list(1)
+    rows       = await db[ASSIGNMENT_COL].aggregate(pipeline).to_list(1)
     assignment = serialize(rows[0]) if rows else None
 
     return {"intern": intern, "assignment": assignment}
 
 
-@router.get("/intern/standup/today", summary="Intern: check today's standup")
+@router.get("/intern/standup/today", summary="Intern: has today's standup been submitted?")
 async def get_standup_today(
     request: Request,
-    user: dict = Depends(require_role("Intern")),
+    user:    dict = Depends(require_role("Intern")),
 ):
-    db = get_db(request)
+    db     = _db(request)
     intern = serialize(await db[INTERN_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not intern:
         raise HTTPException(404, "Intern profile not found")
 
-    today = today_start()
-    standup = serialize(await db[STANDUP_COL].find_one({
-        "internId": oid(intern["_id"]),
-        "date": today,
-    }))
-    return {"submitted": standup is not None, "standup": standup}
+    today   = _utc_today()
+    standup = serialize(await db[STANDUP_COL].find_one({"internId": oid(intern["_id"]), "date": today}))
+    return {"submitted": standup is not None, "standup": standup, "isWeekday": _is_weekday()}
 
 
 class StandupBody(BaseModel):
     yesterday: str
-    today: str
-    blockers: Optional[str] = ""
+    today:     str
+    blockers:  Optional[str] = ""
 
 
-@router.post("/intern/standup", status_code=201, summary="Intern: submit standup")
+@router.post("/intern/standup", status_code=201, summary="Intern: submit daily standup")
 async def submit_standup(
-    body: StandupBody,
+    body:    StandupBody,
     request: Request,
-    user: dict = Depends(require_role("Intern")),
+    user:    dict = Depends(require_role("Intern")),
 ):
     if not body.yesterday.strip():
         raise HTTPException(400, "'yesterday' is required")
     if not body.today.strip():
         raise HTTPException(400, "'today' is required")
+    if not _is_weekday():
+        raise HTTPException(400, "Standups are only for working days (Mon–Fri)")
 
-    db = get_db(request)
+    db     = _db(request)
     intern = serialize(await db[INTERN_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not intern:
         raise HTTPException(404, "Intern profile not found")
@@ -210,7 +214,7 @@ async def submit_standup(
     if not assignment or not assignment.get("buddyId"):
         raise HTTPException(400, "No buddy assigned yet — ask your Tech Lead to assign one")
 
-    today = today_start()
+    today = _utc_today()
     doc = {
         "internId":    oid(intern["_id"]),
         "buddyId":     assignment["buddyId"],
@@ -218,7 +222,7 @@ async def submit_standup(
         "yesterday":   body.yesterday.strip(),
         "today":       body.today.strip(),
         "blockers":    body.blockers.strip() if body.blockers else "",
-        "submittedAt": datetime.now(timezone.utc),
+        "submittedAt": datetime.now(timezone.utc).replace(tzinfo=None),
         "slaStatus":   "PENDING",
     }
     result = await db[STANDUP_COL].find_one_and_update(
@@ -230,14 +234,14 @@ async def submit_standup(
     return {"standup": serialize(result)}
 
 
-@router.get("/intern/standups", summary="Intern: standup history")
+@router.get("/intern/standups", summary="Intern: paginated standup history")
 async def get_standup_history(
     request: Request,
-    page:  int = Query(1,  ge=1),
-    limit: int = Query(20, ge=1, le=50),
-    user: dict = Depends(require_role("Intern")),
+    page:    int = Query(1,  ge=1),
+    limit:   int = Query(20, ge=1, le=50),
+    user:    dict = Depends(require_role("Intern")),
 ):
-    db = get_db(request)
+    db     = _db(request)
     intern = serialize(await db[INTERN_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not intern:
         raise HTTPException(404, "Intern profile not found")
@@ -252,12 +256,12 @@ async def get_standup_history(
     }
 
 
-@router.get("/intern/progress", summary="Intern: milestones + summary")
+@router.get("/intern/progress", summary="Intern: milestones + completion summary")
 async def get_progress(
     request: Request,
-    user: dict = Depends(require_role("Intern")),
+    user:    dict = Depends(require_role("Intern")),
 ):
-    db = get_db(request)
+    db     = _db(request)
     intern = serialize(await db[INTERN_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not intern:
         raise HTTPException(404, "Intern profile not found")
@@ -277,44 +281,137 @@ async def get_progress(
     }
 
 
-@router.get("/intern/compliance", summary="Intern: standup compliance %")
+class MilestoneUpdateBody(BaseModel):
+    status: str
+
+
+@router.patch("/intern/milestone/{milestone_id}", summary="Intern: self-update own milestone status")
+async def update_milestone_status(
+    milestone_id: str,
+    body:         MilestoneUpdateBody,
+    request:      Request,
+    user:         dict = Depends(require_role("Intern")),
+):
+    """
+    Intern can mark their own milestones as IN_PROGRESS or COMPLETED.
+    They cannot mark a COMPLETED milestone back to PENDING (prevents gaming).
+    """
+    if body.status not in MILESTONE_STATUSES:
+        raise HTTPException(400, f"Invalid status. Choose from: {', '.join(MILESTONE_STATUSES)}")
+
+    db     = _db(request)
+    intern = serialize(await db[INTERN_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
+    if not intern:
+        raise HTTPException(404, "Intern profile not found")
+
+    milestone = await db[MILESTONE_COL].find_one({
+        "_id":      oid(milestone_id),
+        "internId": oid(intern["_id"]),
+    })
+    if not milestone:
+        raise HTTPException(404, "Milestone not found or does not belong to you")
+    if milestone.get("status") == "COMPLETED" and body.status == "PENDING":
+        raise HTTPException(409, "Cannot move a completed milestone back to PENDING")
+
+    now    = datetime.now(timezone.utc).replace(tzinfo=None)
+    update = {"status": body.status, "updatedAt": now}
+    if body.status == "COMPLETED":
+        update["completedAt"] = now
+
+    result = await db[MILESTONE_COL].find_one_and_update(
+        {"_id": oid(milestone_id)},
+        {"$set": update},
+        return_document=True,
+    )
+    return {"milestone": serialize(result)}
+
+
+@router.get("/intern/streak", summary="Intern: consecutive daily standup submission streak")
+async def get_streak(
+    request: Request,
+    user:    dict = Depends(require_role("Intern")),
+):
+    """
+    Counts how many consecutive weekdays (going backwards from today) the intern
+    submitted a standup. Useful for gamification / compliance nudges.
+    """
+    db     = _db(request)
+    intern = serialize(await db[INTERN_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
+    if not intern:
+        raise HTTPException(404, "Intern profile not found")
+
+    # Fetch last 60 standup dates (enough for any real streak)
+    rows = await db[STANDUP_COL].find(
+        {"internId": oid(intern["_id"])},
+        {"date": 1},
+    ).sort("date", -1).limit(60).to_list(60)
+
+    submitted_dates = {_strip_tz(r["date"]).date() for r in rows}
+
+    streak  = 0
+    cursor  = _utc_today().date()
+    # If today not submitted yet, start checking from yesterday
+    if cursor not in submitted_dates:
+        cursor -= timedelta(days=1)
+
+    while True:
+        if cursor.weekday() >= 5:       # skip weekends
+            cursor -= timedelta(days=1)
+            continue
+        if cursor not in submitted_dates:
+            break
+        streak += 1
+        cursor -= timedelta(days=1)
+
+    return {"streak": streak, "unit": "working days"}
+
+
+@router.get("/intern/compliance", summary="Intern: standup compliance percentage since start date")
 async def get_compliance(
     request: Request,
-    user: dict = Depends(require_role("Intern")),
+    user:    dict = Depends(require_role("Intern")),
 ):
-    db = get_db(request)
+    db     = _db(request)
     intern = serialize(await db[INTERN_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not intern:
         raise HTTPException(404, "Intern profile not found")
 
     raw_start = intern.get("startDate") or intern.get("createdAt")
-    start = raw_start if isinstance(raw_start, datetime) else datetime.fromisoformat(str(raw_start))
-    today = datetime.now(timezone.utc)
+    if raw_start is None:
+        raise HTTPException(400, "Intern has no startDate or createdAt field")
 
-    working_days = count_working_days(start, today)
-    submitted    = await db[STANDUP_COL].count_documents({
+    # Handle both datetime objects and ISO strings robustly
+    if isinstance(raw_start, datetime):
+        start = _strip_tz(raw_start)
+    else:
+        # Remove timezone suffix so fromisoformat works on Python <3.11
+        start = datetime.fromisoformat(str(raw_start).replace("Z", "").split("+")[0].split(".")[0])
+
+    today        = _utc_today()
+    working_days = _count_working_days(start, today)
+
+    submitted = await db[STANDUP_COL].count_documents({
         "internId": oid(intern["_id"]),
-        "date": {"$gte": start.replace(hour=0, minute=0, second=0, microsecond=0),
-                 "$lte": today.replace(hour=23, minute=59, second=59)},
+        "date":     {"$gte": start.replace(hour=0, minute=0, second=0, microsecond=0), "$lte": today},
     })
     compliance = round((submitted / working_days) * 100) if working_days > 0 else 0
     return {"submitted": submitted, "workingDays": working_days, "compliance": compliance}
 
 
-@router.get("/intern/feedback", summary="Intern: published reviews")
+@router.get("/intern/feedback", summary="Intern: published performance reviews")
 async def get_feedback(
     request: Request,
-    user: dict = Depends(require_role("Intern")),
+    user:    dict = Depends(require_role("Intern")),
 ):
-    db = get_db(request)
+    db     = _db(request)
     intern = serialize(await db[INTERN_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not intern:
         raise HTTPException(404, "Intern profile not found")
 
     pipeline = [
         {"$match": {"internId": oid(intern["_id"]), "state": "PUBLISHED"}},
-        {"$lookup": {"from": USER_COL, "localField": "authorBuddyId", "foreignField": "_id", "as": "_author",
-                     "pipeline": [{"$project": {"name": 1, "email": 1}}]}},
+        {"$lookup": {"from": USER_COL, "localField": "authorBuddyId", "foreignField": "_id",
+                     "as": "_author", "pipeline": [{"$project": {"name": 1, "email": 1}}]}},
         {"$addFields": {"authorBuddyId": {"$arrayElemAt": ["$_author", 0]}}},
         {"$project": {"_author": 0}},
         {"$sort": {"publishedAt": -1}},
@@ -327,31 +424,25 @@ async def get_feedback(
 #  TECH LEAD ROUTES
 # ════════════════════════════════════════════════════════════════════════════════
 
-@router.get("/tech-lead/interns", summary="Tech Lead: list assigned interns")
+@router.get("/tech-lead/interns", summary="Tech Lead: list all assigned interns with buddy info")
 async def get_tl_interns(
     request: Request,
-    user: dict = Depends(require_role("Tech Lead")),
+    user:    dict = Depends(require_role("Tech Lead")),
 ):
-    db = get_db(request)
+    db      = _db(request)
     tl_user = serialize(await db[USER_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not tl_user:
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Tech Lead user not found")
 
     pipeline = [
         {"$match": {"techLeadId": oid(tl_user["_id"])}},
         {"$lookup": {
-            "from": INTERN_COL,
-            "localField": "internId",
-            "foreignField": "_id",
-            "as": "_intern",
+            "from": INTERN_COL, "localField": "internId", "foreignField": "_id", "as": "_intern",
             "pipeline": [{"$project": {"name": 1, "email": 1, "employeeCode": 1,
                                        "department": 1, "startDate": 1, "endDate": 1, "status": 1}}],
         }},
         {"$lookup": {
-            "from": USER_COL,
-            "localField": "buddyId",
-            "foreignField": "_id",
-            "as": "_buddy",
+            "from": USER_COL, "localField": "buddyId", "foreignField": "_id", "as": "_buddy",
             "pipeline": [{"$project": {"name": 1, "email": 1}}],
         }},
         {"$addFields": {
@@ -359,8 +450,7 @@ async def get_tl_interns(
             "buddyData":  {"$arrayElemAt": ["$_buddy",  0]},
         }},
     ]
-
-    rows = await db[ASSIGNMENT_COL].aggregate(pipeline).to_list(None)
+    rows    = await db[ASSIGNMENT_COL].aggregate(pipeline).to_list(None)
     interns = []
     for row in rows:
         if not row.get("internData"):
@@ -375,18 +465,18 @@ async def get_tl_interns(
     return {"interns": interns}
 
 
-@router.get("/tech-lead/standup-feed", summary="Tech Lead: standup feed for all interns")
+@router.get("/tech-lead/standup-feed", summary="Tech Lead: standup feed across all assigned interns")
 async def get_standup_feed(
     request: Request,
-    date:  Optional[str] = Query(None, description="YYYY-MM-DD filter"),
-    page:  int = Query(1,  ge=1),
-    limit: int = Query(30, ge=1, le=50),
-    user: dict = Depends(require_role("Tech Lead")),
+    date:    Optional[str] = Query(None, description="Filter by date YYYY-MM-DD"),
+    page:    int = Query(1,  ge=1),
+    limit:   int = Query(30, ge=1, le=50),
+    user:    dict = Depends(require_role("Tech Lead")),
 ):
-    db = get_db(request)
+    db      = _db(request)
     tl_user = serialize(await db[USER_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not tl_user:
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Tech Lead user not found")
 
     assignments = await db[ASSIGNMENT_COL].find(
         {"techLeadId": oid(tl_user["_id"])}, {"internId": 1}
@@ -395,11 +485,12 @@ async def get_standup_feed(
 
     filt: dict = {"internId": {"$in": intern_ids}}
     if date:
-        day_start = datetime.fromisoformat(date).replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
-        )
-        day_end   = day_start.replace(hour=23, minute=59, second=59)
-        filt["date"] = {"$gte": day_start, "$lte": day_end}
+        try:
+            # Parse and keep as naive UTC to match stored dates
+            day = datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, "date must be YYYY-MM-DD")
+        filt["date"] = {"$gte": day, "$lte": day.replace(hour=23, minute=59, second=59)}
 
     pipeline = [
         {"$match": filt},
@@ -422,15 +513,15 @@ async def get_standup_feed(
     return {"standups": standups, "total": total, "page": page, "limit": limit}
 
 
-@router.get("/tech-lead/reviews", summary="Tech Lead: reviews pending TL approval")
+@router.get("/tech-lead/reviews", summary="Tech Lead: reviews waiting for TL sign-off")
 async def get_tl_reviews(
     request: Request,
-    user: dict = Depends(require_role("Tech Lead")),
+    user:    dict = Depends(require_role("Tech Lead")),
 ):
-    db = get_db(request)
+    db      = _db(request)
     tl_user = serialize(await db[USER_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not tl_user:
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Tech Lead user not found")
 
     assignments = await db[ASSIGNMENT_COL].find(
         {"techLeadId": oid(tl_user["_id"])}, {"internId": 1}
@@ -439,9 +530,11 @@ async def get_tl_reviews(
 
     pipeline = [
         {"$match": {"internId": {"$in": intern_ids}, "state": "TL_REVIEW"}},
-        {"$lookup": {"from": INTERN_COL, "localField": "internId",      "foreignField": "_id", "as": "_intern",
+        {"$lookup": {"from": INTERN_COL, "localField": "internId",
+                     "foreignField": "_id", "as": "_intern",
                      "pipeline": [{"$project": {"name": 1, "email": 1, "employeeCode": 1}}]}},
-        {"$lookup": {"from": USER_COL,   "localField": "authorBuddyId", "foreignField": "_id", "as": "_author",
+        {"$lookup": {"from": USER_COL, "localField": "authorBuddyId",
+                     "foreignField": "_id", "as": "_author",
                      "pipeline": [{"$project": {"name": 1}}]}},
         {"$addFields": {
             "internId":      {"$arrayElemAt": ["$_intern",  0]},
@@ -458,41 +551,42 @@ class ForwardReviewBody(BaseModel):
     comment: Optional[str] = ""
 
 
-@router.post("/tech-lead/reviews/{review_id}/forward", summary="Tech Lead: forward review to Manager")
+@router.post("/tech-lead/reviews/{review_id}/forward",
+             summary="Tech Lead: approve review and forward to Manager")
 async def forward_review(
     review_id: str,
-    body: ForwardReviewBody,
-    request: Request,
-    user: dict = Depends(require_role("Tech Lead")),
+    body:      ForwardReviewBody,
+    request:   Request,
+    user:      dict = Depends(require_role("Tech Lead")),
 ):
-    db = get_db(request)
+    db      = _db(request)
     tl_user = serialize(await db[USER_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not tl_user:
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Tech Lead user not found")
 
     review = await db[REVIEW_COL].find_one({"_id": oid(review_id)})
     if not review:
         raise HTTPException(404, "Review not found")
     if review.get("state") != "TL_REVIEW":
-        raise HTTPException(409, f"Review is in \"{review['state']}\" — cannot forward from here")
+        raise HTTPException(409, f"Review is in '{review['state']}' — can only forward from TL_REVIEW")
 
     owns = await db[ASSIGNMENT_COL].find_one({
-        "internId": review["internId"],
+        "internId":   review["internId"],
         "techLeadId": oid(tl_user["_id"]),
     })
     if not owns:
         raise HTTPException(403, "This review does not belong to your interns")
 
-    now    = datetime.now(timezone.utc)
+    now    = datetime.now(timezone.utc).replace(tzinfo=None)
     stages = review.get("stages", [])
-    updated = False
+    tl_stage_closed = False
     for stage in stages:
         if stage.get("stage") == "TL_REVIEW" and not stage.get("exitedAt"):
             stage["comment"]  = body.comment.strip() if body.comment else ""
             stage["exitedAt"] = now
-            updated = True
+            tl_stage_closed   = True
             break
-    if not updated:
+    if not tl_stage_closed:
         stages.append({
             "stage": "TL_REVIEW", "actorId": oid(tl_user["_id"]),
             "comment": body.comment.strip() if body.comment else "",
@@ -513,16 +607,16 @@ class AssignBuddyBody(BaseModel):
     buddyUserId: str
 
 
-@router.post("/tech-lead/assign-buddy", summary="Tech Lead: assign buddy to intern")
+@router.post("/tech-lead/assign-buddy", summary="Tech Lead: assign or re-assign a buddy to an intern")
 async def assign_buddy(
-    body: AssignBuddyBody,
+    body:    AssignBuddyBody,
     request: Request,
-    user: dict = Depends(require_role("Tech Lead")),
+    user:    dict = Depends(require_role("Tech Lead")),
 ):
-    db = get_db(request)
+    db      = _db(request)
     tl_user = serialize(await db[USER_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not tl_user:
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Tech Lead user not found")
 
     assignment = await db[ASSIGNMENT_COL].find_one({
         "internId":   oid(body.internId),
@@ -535,27 +629,22 @@ async def assign_buddy(
     if not buddy:
         raise HTTPException(404, "Buddy user not found")
     if buddy.get("role") != "Buddy":
-        raise HTTPException(400, f"\"{buddy['name']}\" has role \"{buddy['role']}\", not \"Buddy\"")
+        raise HTTPException(400, f"'{buddy['name']}' has role '{buddy['role']}', not 'Buddy'")
 
-    now     = datetime.now(timezone.utc)
+    now     = datetime.now(timezone.utc).replace(tzinfo=None)
     history = assignment.get("history", [])
     history.append({
-        "field":    "buddyId",
-        "fromId":   assignment.get("buddyId"),
-        "toId":     oid(body.buddyUserId),
-        "byUserId": oid(tl_user["_id"]),
-        "at":       now,
+        "field": "buddyId", "fromId": assignment.get("buddyId"),
+        "toId":  oid(body.buddyUserId), "byUserId": oid(tl_user["_id"]), "at": now,
     })
-
     new_state = "BUDDY_ASSIGNED" if assignment.get("state") == "TECHLEAD_ASSIGNED" else assignment.get("state")
-    result = await db[ASSIGNMENT_COL].find_one_and_update(
+    result    = await db[ASSIGNMENT_COL].find_one_and_update(
         {"_id": assignment["_id"]},
         {"$set": {"buddyId": oid(body.buddyUserId), "state": new_state,
                   "history": history, "updatedAt": now}},
         return_document=True,
     )
 
-    # Populate buddy info
     pipeline = [
         {"$match": {"_id": result["_id"]}},
         {"$lookup": {"from": USER_COL, "localField": "buddyId", "foreignField": "_id", "as": "_buddy",
@@ -567,12 +656,12 @@ async def assign_buddy(
     return {"assignment": serialize(rows[0]) if rows else serialize(result)}
 
 
-@router.get("/tech-lead/buddies", summary="Tech Lead: list all active Buddy users")
+@router.get("/tech-lead/buddies", summary="Tech Lead: list available Buddy users for assignment")
 async def get_buddies(
     request: Request,
-    user: dict = Depends(require_role("Tech Lead")),
+    user:    dict = Depends(require_role("Tech Lead")),
 ):
-    db = get_db(request)
+    db      = _db(request)
     buddies = [
         serialize(b) for b in
         await db[USER_COL].find(
@@ -583,22 +672,24 @@ async def get_buddies(
     return {"buddies": buddies}
 
 
-@router.get("/tech-lead/dashboard-summary", summary="Tech Lead: dashboard stats")
+@router.get("/tech-lead/dashboard-summary", summary="Tech Lead: at-a-glance stats for dashboard")
 async def get_dashboard_summary(
     request: Request,
-    user: dict = Depends(require_role("Tech Lead")),
+    user:    dict = Depends(require_role("Tech Lead")),
 ):
-    db = get_db(request)
+    db      = _db(request)
     tl_user = serialize(await db[USER_COL].find_one({"employeeId": user.get(SSO_ID_FIELD)}))
     if not tl_user:
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Tech Lead user not found")
 
     assignments = await db[ASSIGNMENT_COL].find(
         {"techLeadId": oid(tl_user["_id"])}, {"internId": 1, "buddyId": 1}
     ).to_list(None)
     intern_ids = [a["internId"] for a in assignments]
 
-    today = today_start()
+    today = _utc_today()
+
+    # Run all three DB counts concurrently
     today_standups, pending_reviews, unassigned_buddy = await asyncio.gather(
         db[STANDUP_COL].count_documents({"internId": {"$in": intern_ids}, "date": today}),
         db[REVIEW_COL].count_documents({"internId": {"$in": intern_ids}, "state": "TL_REVIEW"}),
@@ -612,7 +703,3 @@ async def get_dashboard_summary(
         "unassignedBuddy":         unassigned_buddy,
         "buddyAssignmentComplete": len(intern_ids) - unassigned_buddy,
     }
-
-
-# asyncio import needed for gather
-import asyncio
